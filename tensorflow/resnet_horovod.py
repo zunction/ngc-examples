@@ -8,7 +8,7 @@ parser.add_argument("--keras_amp", action="store_true", default=False,
                     help="Use Keras AMP for mixed precision training")
 parser.add_argument("--xla", action="store_true", default=False,
                     help="Use XLA compiler")
-parser.add_argument("--fp16comp", action="store_true", default=True,
+parser.add_argument("--fp16comp", action="store_true", default=False,
                     help="Use float16 compression during allreduce")
 args = parser.parse_args()
 
@@ -16,6 +16,11 @@ import os
 os.environ["TF_XLA_FLAGS"] = "--tf_xla_cpu_global_jit"
 os.environ["TF_USE_CUDNN_BATCHNORM_SPATIAL_PERSISTENT"] = "1"
 os.environ["TF_DISABLE_NVTX_RANGES"] = "1"
+os.environ["TF_XLA_FLAGS"] = "--tf_xla_max_cluster_size=500"
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
+import logging
+logger = logging.getLogger()
+logger.setLevel(logging.WARN)
 
 import multiprocessing
 import tensorflow.compat.v2 as tf
@@ -27,6 +32,7 @@ hvd_size = hvd.size()
 
 gpus = tf.config.experimental.list_physical_devices("GPU")
 tf.config.experimental.set_visible_devices(gpus[hvd_rank], "GPU")
+tf.config.experimental.set_memory_growth(physical_devices[hvd_rank], True)
 
 import tensorflow_datasets as tfds
 import tf_models
