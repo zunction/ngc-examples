@@ -1,12 +1,14 @@
-import os
 import time
-import argparse
-os.environ["TF_XLA_FLAGS"] = "--tf_xla_cpu_global_jit"
-os.environ["TF_USE_CUDNN_BATCHNORM_SPATIAL_PERSISTENT"] = "1"
-os.environ["TF_DISABLE_NVTX_RANGES"] = "1"
+
+import os
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
+os.environ["NCCL_DEBUG"] = "WARN"
+os.environ["TF_GPU_THREAD_MODE"] = "gpu_private"
+os.environ["TF_GPU_THREAD_COUNT"] = "2"
 
 import tensorflow.compat.v2 as tf
 import horovod.tensorflow.keras as hvd
+import argparse
 
 parser = argparse.ArgumentParser(
     description="Train and evaluate Transformers for various GLUE tasks",
@@ -18,23 +20,29 @@ parser.add_argument("--keras_amp", action="store_true", default=False,
                     help="Use Keras AMP for mixed precision training")
 parser.add_argument("--xla", action="store_true", default=False,
                     help="Use XLA compiler")
-parser.add_argument("--fp16comp", action="store_true", default=True,
+parser.add_argument("--fp16comp", action="store_true", default=False,
                     help="Use float16 compression during allreduce")
-parser.add_argument("--epochs", default=10,
+parser.add_argument("--epochs", default=3,
                     help="Number of epochs to train for",
                     type=int)
-parser.add_argument("--batch_size", default=6,
+parser.add_argument("--interval", default=1,
+                    help="Number of fake epochs per real epoch",
+                    type=int)
+parser.add_argument("--batch_size", default=8,
                     help="Batch size to use for training",
                     type=int)
 parser.add_argument("--lr", default=1e-5,
                     help="Learning Rate to use for training",
+                    type=float)
+parser.add_argument("--warmup_prop", default=1.0,
+                    help="Proportion of steps to use for LR warmup",
                     type=float)
 parser.add_argument("--maxseqlen", default=128,
                     help="Maximum input sequence length",
                     type=int)
 parser.add_argument("--task", default="mrpc",
                     help="Task for training and evaluation")
-parser.add_argument("--model", default="xlm-mlm-en-2048",
+parser.add_argument("--model", default="bert-large-cased-whole-word-masking",
                     help="Which Transformer model to use")
 parser.add_argument("--outpath", default="./output/",
                     help="Output path")
@@ -74,6 +82,9 @@ task_list = {
     "cola": "glue/cola",
     "mrpc": "glue/mrpc",
     "sst-2": "glue/sst2",
+    "qqp": "glue/qqp",
+    "mnli": "glue/mnli",
+    "qnli": "glue/qnli"
 }
 
 task_name = args.task
@@ -86,22 +97,32 @@ tf.config.optimizer.set_experimental_options({
     "auto_mixed_precision": USE_AMP
 })
 
-print("Building input pipeline...")
+# Building input pipeline
 
 tokenizer = xfmer_utils.create_tokenizer(model_name)
-task_dataset = xfmer_utils.return_glue_task(tokenizer, dataset_name, task_name, MAX_SEQ_LEN)
+task_dataset = xfmer_utils.return_glue_task(tokenizer, dataset_name, task_name, MAX_SEQ_LEN,
+                                            index=hvd_rank, num_shards=hvd_size)
 train_dataset = task_dataset["train_dataset"]
-train_dataset = train_dataset.shard(hvd_size, hvd_rank)
-train_dataset = train_dataset.repeat().shuffle(100000).batch(BATCH_SIZE)
-train_dataset = train_dataset.prefetch(64)
+train_dataset = train_dataset.repeat().shuffle(task_dataset["train_examples"])
+train_dataset = train_dataset.batch(BATCH_SIZE).prefetch(64)
 
-valid_dataset = task_dataset["valid_dataset"].repeat().batch(BATCH_SIZE)
-valid_dataset = valid_dataset.prefetch(64)
+valid_dataset = task_dataset["valid_dataset"].repeat()
+val_batchsize = int(BATCH_SIZE * 2)
+valid_dataset = valid_dataset.batch(val_batchsize, drop_remainder=True).prefetch(64)
+
+test_dataset = task_dataset["test_dataset"].repeat()
+test_dataset = test_dataset.batch(BATCH_SIZE, drop_remainder=False).prefetch(64)
+
+_, _, _, = train_dataset.take(1), valid_dataset.take(1), test_dataset.take(1)
 
 print(hvd_rank, "Building model...")
 
+if hvd_rank == 0:
+    time.sleep(1)
+    script_start_time = time.time()
+
 model = xfmer_utils.create_model(model_name, task_dataset["num_labels"])
-opt = tf.keras.optimizers.Adam(learning_rate=LEARNING_RATE, epsilon=1e-08)
+opt = tf.keras.optimizers.Adam(learning_rate=LEARNING_RATE, epsilon=1e-07)
 if args.fp16comp:
     print("Using float16 compression for all-reduce")
     compression = hvd.Compression.fp16
@@ -118,12 +139,18 @@ model.compile(loss=tf.keras.losses.SparseCategoricalCrossentropy(from_logits=Tru
               experimental_run_tf_function=False)
 
 # train model
-    
-train_steps_per_epoch = int(task_dataset["train_examples"]/BATCH_SIZE/hvd_size)
-valid_steps_per_epoch = int(task_dataset["valid_examples"]/BATCH_SIZE/hvd_size)
 
-lr_schedule = hvd.callbacks.LearningRateWarmupCallback(warmup_epochs=1, steps_per_epoch=train_steps_per_epoch)
-time_callback = xfmer_utils.TimeHistory()
+fake_epochs_ratio = int(args.interval)
+    
+train_steps_per_epoch = int(task_dataset["train_examples"]/BATCH_SIZE/hvd_size) -1
+valid_steps_per_epoch = int(task_dataset["valid_examples"]/val_batchsize/hvd_size) - 1
+
+warmup_epochs = int(EPOCHS*fake_epochs_ratio*args.warmup_prop)
+
+print("Warmup epochs:", warmup_epochs)
+
+lr_schedule = hvd.callbacks.LearningRateWarmupCallback(warmup_epochs=warmup_epochs, verbose=1,
+                                                       steps_per_epoch=int(train_steps_per_epoch/fake_epochs_ratio))
 hvd_broadcast = hvd.callbacks.BroadcastGlobalVariablesCallback(0)
 hvd_metric = hvd.callbacks.MetricAverageCallback()
 
@@ -134,33 +161,45 @@ if hvd_rank == 0:
         print("XLA is enabled. First run will be delayed due to XLA JIT compilation.")
     if USE_AMP:
         print("Model is using Automatic Mixed Precision")
-    verbose = 2
+    verbose = 1
     model.summary()
+    time_callback = xfmer_utils.TimeHistory()
+    checkpoints = tf.keras.callbacks.ModelCheckpoint(monitor="val_accuracy", mode="max",
+                                                     filepath=OUT_PATH+"weights.h5",
+                                                     save_weights_only=True,
+                                                     save_best_only=True)
     callbacks_list.append(time_callback)
+    callbacks_list.append(checkpoints)
 else:
     verbose = 0
     
 print(hvd_rank, "Starting training...")
 
-log = model.fit(train_dataset, epochs=EPOCHS, steps_per_epoch=train_steps_per_epoch,
+log = model.fit(train_dataset,
+                epochs=EPOCHS*fake_epochs_ratio, steps_per_epoch=int(train_steps_per_epoch/fake_epochs_ratio),
+                validation_data=valid_dataset, validation_steps=valid_steps_per_epoch,
                 callbacks=callbacks_list, verbose=verbose)
 
-if hvd_rank == 0:    
+if hvd_rank == 0:
+    model.load_weights(OUT_PATH+"weights.h5")
+    score = model.evaluate(test_dataset, steps=int(task_dataset["test_examples"]/BATCH_SIZE))
+    script_end_time = time.time()
+
     # results
     
+    total_time = int(script_end_time - script_start_time)
     cold_start_duration = max(time_callback.times)
     epoch_duration = min(time_callback.times)
-    eg_per_sec = int(train_steps_per_epoch*BATCH_SIZE/epoch_duration)
+    eg_per_sec = int(train_steps_per_epoch/fake_epochs_ratio*BATCH_SIZE/epoch_duration)
 
     print("\n\n=================\n\n")
     print("\nResults (DIST/XLA/AMP:", "horovod", USE_XLA, USE_AMP, ")", task_name)
-    print("Total time:", int(sum(time_callback.times)), "seconds")
+    print("Total time:", total_time, "seconds")
     print("Cold Start time:", int(cold_start_duration - epoch_duration))
     print("Training Throughput:", eg_per_sec * hvd_size, "examples per second")
 
     print("Throughput per GPU:", eg_per_sec, "examples per second")
-
-    score = model.evaluate(valid_dataset, steps=valid_steps_per_epoch)
+    
     print("Loss:", score[0])
-    print("Accuracy:", score[1])
+    print("Accuracy:", round(score[1],4))
     print("\n\n=================\n\n")

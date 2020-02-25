@@ -35,7 +35,7 @@ tf.config.experimental.set_visible_devices(gpus[hvd_rank], "GPU")
 tf.config.experimental.set_memory_growth(physical_devices[hvd_rank], True)
 
 import tensorflow_datasets as tfds
-import tf_models
+import rn_models
 import utils
 
 LEARNING_RATE = 0.001
@@ -96,10 +96,10 @@ if args.keras_amp:
     
 if args.rn152:
     print("Using ResNet-152 model")
-    model = tf_models.rn152(IMG_SIZE, num_class)
+    model = rn_models.rn152(IMG_SIZE, num_class)
 else:
     print("Using ResNet-50 model")
-    model = tf_models.rn50(IMG_SIZE, num_class)
+    model = rn_models.rn50(IMG_SIZE, num_class)
 opt = tf.keras.optimizers.Adam(lr=LEARNING_RATE)
 if args.amp:
     opt = tf.keras.mixed_precision.experimental.LossScaleOptimizer(opt, "dynamic")

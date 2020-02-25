@@ -18,7 +18,7 @@ os.environ["TF_DISABLE_NVTX_RANGES"] = "1"
 import multiprocessing
 import tensorflow.compat.v2 as tf
 import tensorflow_datasets as tfds
-import tf_models
+import rn_models
 import utils
 
 LEARNING_RATE = 0.001
@@ -79,9 +79,9 @@ if args.keras_amp:
     
 with strategy.scope():
     if args.rn152:
-        model = tf_models.rn152(IMG_SIZE, num_class)
+        model = rn_models.rn152(IMG_SIZE, num_class)
     else:
-        model = tf_models.rn50(IMG_SIZE, num_class)
+        model = rn_models.rn50(IMG_SIZE, num_class)
     opt = tf.keras.optimizers.Adam(lr=LEARNING_RATE)
     if args.amp:
         opt = tf.keras.mixed_precision.experimental.LossScaleOptimizer(opt, "dynamic")
