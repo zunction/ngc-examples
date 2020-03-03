@@ -3,8 +3,6 @@ import time
 import os
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
 os.environ["NCCL_DEBUG"] = "WARN"
-os.environ["TF_GPU_THREAD_MODE"] = "gpu_private"
-os.environ["TF_GPU_THREAD_COUNT"] = "2"
 
 import tensorflow.compat.v2 as tf
 import horovod.tensorflow.keras as hvd
@@ -16,8 +14,6 @@ parser = argparse.ArgumentParser(
 
 parser.add_argument("--amp", action="store_true", default=False,
                     help="Use grappler AMP for mixed precision training")
-parser.add_argument("--keras_amp", action="store_true", default=False,
-                    help="Use Keras AMP for mixed precision training")
 parser.add_argument("--xla", action="store_true", default=False,
                     help="Use XLA compiler")
 parser.add_argument("--fp16comp", action="store_true", default=False,
@@ -75,6 +71,7 @@ tf.config.experimental.set_memory_growth(physical_devices[hvd_rank], True)
 
 import transformers as xfmers
 import xfmer_utils
+import optimizers
 
 # training parameters
 
@@ -161,7 +158,7 @@ if hvd_rank == 0:
         print("XLA is enabled. First run will be delayed due to XLA JIT compilation.")
     if USE_AMP:
         print("Model is using Automatic Mixed Precision")
-    verbose = 1
+    verbose = 2
     model.summary()
     time_callback = xfmer_utils.TimeHistory()
     checkpoints = tf.keras.callbacks.ModelCheckpoint(monitor="val_accuracy", mode="max",

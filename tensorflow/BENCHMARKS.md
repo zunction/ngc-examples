@@ -32,8 +32,23 @@ mpirun -np 4 \
 
 | V100 | Training time | Images/sec | Val Acc |
 | ---- | ------------- | ---------- | ------- |
-| 4    | 1056s          | 750       | 0.9241  |
+| 4    | 1056s         | 750        | 0.9241  |
 
 ## Transformer Fine-tuning
 
-WIP
+```shell
+mpirun -np 4 \
+    -bind-to none -map-by slot \
+    -x NCCL_DEBUG=INFO -x LD_LIBRARY_PATH -x PATH \
+    -mca pml ob1 -mca btl ^openib \
+    python3 xfmer_horovod.py \
+    --amp --xla --epochs 1 --batch_size 35 --warmup_prop 0.1 --maxseqlen 64 \
+    --task qqp --model bert-large-cased-whole-word-masking \
+    --fp16comp --lr 0.00002
+```
+
+| V100 | Training time | Examples/sec | Val Acc |
+| ---- | ------------- | ------------ | ------- |
+| 4    | 1116s         | 480          | 0.8948  |
+
+

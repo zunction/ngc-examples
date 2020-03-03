@@ -15,13 +15,13 @@ parser.add_argument("--xla", action="store_true", default=False,
 parser.add_argument("--fp16comp", action="store_true", default=False,
                     help="Use float16 compression during allreduce")
 parser.add_argument("--batchsize", default=128, type=int,
-                    help="Use float16 compression during allreduce")
+                    help="Batch size to use for training")
 parser.add_argument("--imgsize", default=224, type=int,
-                    help="Use float16 compression during allreduce")
+                    help="Image size to use for training")
 parser.add_argument("--lr", default=0.001, type=float,
-                    help="Use float16 compression during allreduce")
+                    help="Learning rate")
 parser.add_argument("--epochs", default=40, type=int,
-                    help="Use float16 compression during allreduce")
+                    help="Number of epochs to train for")
 args = parser.parse_args()
 
 import os
