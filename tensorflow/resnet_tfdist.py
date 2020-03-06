@@ -20,6 +20,8 @@ parser.add_argument("--lr", default=0.001, type=float,
                     help="Learning rate")
 parser.add_argument("--epochs", default=40, type=int,
                     help="Number of epochs to train for")
+parser.add_argument("--stats", action="store_true", default=False,
+                    help="Record stats using NVStatsRecorder")
 args = parser.parse_args()
 
 import os
@@ -42,6 +44,9 @@ import tensorflow_datasets as tfds
 import cnn_models
 import utils
 
+if args.stats:
+    from nvstatsrecorder.callbacks import NVStats, NVLinkStats
+
 print("Using XLA:", args.xla)
 tf.config.optimizer.set_jit(args.xla)
 print("Using grappler AMP:", args.amp)
@@ -50,7 +55,7 @@ tf.config.optimizer.set_experimental_options({"auto_mixed_precision": args.amp})
 strategy = tf.distribute.MirroredStrategy()
 replicas = strategy.num_replicas_in_sync
 
-LEARNING_RATE = args.lr * replicas**0.5
+LEARNING_RATE = args.lr
 BATCH_SIZE = args.batchsize * replicas
 IMG_SIZE = (args.imgsize, args.imgsize)
 EPOCHS = args.epochs
@@ -97,13 +102,13 @@ train = train.shuffle(100000)
 train = train.repeat(count=-1)
 train = train.map(format_train_example, num_parallel_calls=int(multiprocessing.cpu_count())-1)
 train = train.batch(BATCH_SIZE, drop_remainder=True)
-train = train.prefetch(64)
+train = train.prefetch(128)
 
 valid = dataset["validation"]
 valid = valid.repeat(count=-1)
 valid = valid.map(format_test_example, num_parallel_calls=int(multiprocessing.cpu_count())-1)
-valid = valid.batch(32, drop_remainder=False)
-valid = valid.prefetch(64)
+valid = valid.batch(BATCH_SIZE, drop_remainder=False)
+valid = valid.prefetch(128)
 
 print("Output:", str(train.take(1)), str(valid.take(1)))
 
@@ -135,14 +140,19 @@ with strategy.scope():
 
 print("Train model")
 
-callbacks = []
-
-verbose = 2
+verbose = 1
 time_callback = utils.TimeHistory()
-callbacks.append(time_callback)
+callbacks = [time_callback]
+
+if args.stats:
+    SUDO_PASSWORD = os.environ["SUDO_PASSWORD"]
+    nv_stats = NVStats(gpu_index=0)
+    nvlink_stats = NVLinkStats(SUDO_PASSWORD, gpus=[0,1,2,3])
+    callbacks.append(nv_stats)
+    callbacks.append(nvlink_stats)
 
 train_steps = int(num_train/BATCH_SIZE)
-valid_steps = int(num_valid/32)
+valid_steps = int(num_valid/BATCH_SIZE)
 
 train_start = time.time()
 
@@ -152,6 +162,12 @@ with strategy.scope():
               epochs=EPOCHS, callbacks=callbacks, verbose=verbose)
     
 train_end = time.time()
+
+if args.stats:
+    nv_stats_recorder = nv_stats.recorder
+    nvlink_stats_recorder = nvlink_stats.recorder
+    nv_stats_recorder.plot_gpu_util(smooth=10, outpath="resnet_gpu_util.png")
+    nvlink_stats_recorder.plot_nvlink_traffic(smooth=10, outpath="resnet_nvlink_util.png")
 
 duration = min(time_callback.times)
 fps = train_steps*BATCH_SIZE/duration

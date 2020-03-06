@@ -4,7 +4,7 @@ import os
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
 os.environ["NCCL_DEBUG"] = "WARN"
 
-import tensorflow.compat.v2 as tf
+import tensorflow as tf
 import horovod.tensorflow.keras as hvd
 import argparse
 
@@ -40,12 +40,13 @@ parser.add_argument("--task", default="mrpc",
                     help="Task for training and evaluation")
 parser.add_argument("--model", default="bert-large-cased-whole-word-masking",
                     help="Which Transformer model to use")
-parser.add_argument("--outpath", default="./output/",
+parser.add_argument("--outpath", default="./",
                     help="Output path")
-
+parser.add_argument("--stats", action="store_true", default=False,
+                    help="Record stats using NVStatsRecorder")
 args = parser.parse_args()
 
-LEARNING_RATE = float(args.lr)
+LEARNING_RATE = args.lr
 USE_XLA = args.xla
 USE_AMP = args.amp
 model_name = args.model
@@ -72,6 +73,8 @@ tf.config.experimental.set_memory_growth(physical_devices[hvd_rank], True)
 import transformers as xfmers
 import xfmer_utils
 import optimizers
+if args.stats:
+    from nvstatsrecorder.callbacks import NVStats, NVLinkStats
 
 # training parameters
 
@@ -113,10 +116,6 @@ test_dataset = test_dataset.batch(BATCH_SIZE, drop_remainder=False).prefetch(64)
 _, _, _, = train_dataset.take(1), valid_dataset.take(1), test_dataset.take(1)
 
 print(hvd_rank, "Building model...")
-
-if hvd_rank == 0:
-    time.sleep(1)
-    script_start_time = time.time()
 
 model = xfmer_utils.create_model(model_name, task_dataset["num_labels"])
 opt = tf.keras.optimizers.Adam(learning_rate=LEARNING_RATE, epsilon=1e-07)
@@ -162,25 +161,41 @@ if hvd_rank == 0:
     model.summary()
     time_callback = xfmer_utils.TimeHistory()
     checkpoints = tf.keras.callbacks.ModelCheckpoint(monitor="val_accuracy", mode="max",
-                                                     filepath=OUT_PATH+"weights.h5",
+                                                     filepath=OUT_PATH+"checkpoint.h5",
                                                      save_weights_only=True,
                                                      save_best_only=True)
     callbacks_list.append(time_callback)
     callbacks_list.append(checkpoints)
+    if args.stats:
+        SUDO_PASSWORD = os.environ["SUDO_PASSWORD"]
+        nv_stats = NVStats(gpu_index=0)
+        nvlink_stats = NVLinkStats(SUDO_PASSWORD, gpus=[0,1,2,3])
+        callbacks_list.append(nv_stats)
+        callbacks_list.append(nvlink_stats)
 else:
     verbose = 0
     
 print(hvd_rank, "Starting training...")
 
+if hvd_rank == 0:
+    script_start_time = time.time()
+
 log = model.fit(train_dataset,
                 epochs=EPOCHS*fake_epochs_ratio, steps_per_epoch=int(train_steps_per_epoch/fake_epochs_ratio),
                 validation_data=valid_dataset, validation_steps=valid_steps_per_epoch,
-                callbacks=callbacks_list, verbose=verbose)
+                validation_freq=2, callbacks=callbacks_list, verbose=verbose)
 
 if hvd_rank == 0:
-    model.load_weights(OUT_PATH+"weights.h5")
-    score = model.evaluate(test_dataset, steps=int(task_dataset["test_examples"]/BATCH_SIZE))
     script_end_time = time.time()
+    model.load_weights(OUT_PATH+"checkpoint.h5")
+    score = model.evaluate(test_dataset, steps=int(task_dataset["test_examples"]/BATCH_SIZE))
+    
+    if args.stats:
+        nv_stats_recorder = nv_stats.recorder
+        nvlink_stats_recorder = nvlink_stats.recorder
+        SMOOTH = 10
+        nv_stats_recorder.plot_gpu_util(smooth=SMOOTH, outpath="transformer_gpu_util.png")
+        nvlink_stats_recorder.plot_nvlink_traffic(smooth=SMOOTH, outpath="transformer_nvlink_util.png")
 
     # results
     
