@@ -6,6 +6,8 @@ parser.add_argument("--dn201", action="store_true", default=False,
                     help="Train a larger DenseNet-201 model instead of ResNet-50")
 parser.add_argument("--mobilenet", action="store_true", default=False,
                     help="Train a smaller MobileNetV2 model instead of ResNet-50")
+parser.add_argument("--toycnn", action="store_true", default=False,
+                    help="Train a Toy CNN model instead of ResNet-50")
 parser.add_argument("--amp", action="store_true", default=False,
                     help="Use grappler AMP for mixed precision training")
 parser.add_argument("--keras_amp", action="store_true", default=False,
@@ -26,13 +28,14 @@ parser.add_argument("--stats", action="store_true", default=False,
                     help="Record stats using NVStatsRecorder")
 parser.add_argument("--imagenet2012", action="store_true", default=False,
                     help="Train on ImageNet2012")
+parser.add_argument("--train_steps", type=int, default=None)
 args = parser.parse_args()
 
 import os
-os.environ["TF_XLA_FLAGS"] = "--tf_xla_cpu_global_jit"
+#os.environ["TF_XLA_FLAGS"] = "--tf_xla_cpu_global_jit"
 os.environ["TF_USE_CUDNN_BATCHNORM_SPATIAL_PERSISTENT"] = "1"
 os.environ["TF_DISABLE_NVTX_RANGES"] = "1"
-#os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
 import logging
 logger = logging.getLogger()
 logger.setLevel(logging.WARN)
@@ -63,17 +66,23 @@ EPOCHS = args.epochs
 print("Using XLA:", args.xla)
 tf.config.optimizer.set_jit(args.xla)
 print("Using grappler AMP:", args.amp)
-tf.config.optimizer.set_experimental_options({"auto_mixed_precision": args.amp})
+tf.config.optimizer.set_experimental_options({"auto_mixed_precision": args.amp,
+                                              "debug_stripper": True})
 
 print("Loading Dataset")
 
+n_cores = multiprocessing.cpu_count()
+worker_threads = n_cores//hvd_size
+
 if args.imagenet2012:
     dataset, info = tfds.load("imagenet2012",
+                              decoders={'image': tfds.decode.SkipDecoding(),},
                               with_info=True,
                               as_supervised=True)
     num_class = 1000
 else:
     dataset, info = tfds.load("imagenette/320px",
+                              decoders={'image': tfds.decode.SkipDecoding(),},
                               with_info=True,
                               as_supervised=True)
     num_class = 10
@@ -86,44 +95,52 @@ print("Number of validation examples:", num_valid)
 
 @tf.function
 def format_train_example(_image, label):
-    image = tf.image.resize(_image, IMG_SIZE)
+    image = tf.io.decode_jpeg(_image, channels=3,
+                              fancy_upscaling=False,
+                              dct_method="INTEGER_FAST")
+    image = tf.image.resize(image, IMG_SIZE)
     image = tf.image.random_flip_left_right(image)
-    image = (image/127.5) - 1
-    label = tf.one_hot(label, num_class)
+    image = image/255.0
     return image, label
 
 @tf.function
 def format_test_example(_image, label):
-    image = tf.image.resize(_image, IMG_SIZE)
-    image = (image/127.5) - 1
-    label = tf.one_hot(label, num_class)
+    image = tf.io.decode_jpeg(_image, channels=3,
+                              fancy_upscaling=False,
+                              dct_method="INTEGER_FAST")
+    image = tf.image.resize(image, IMG_SIZE)
+    image = image/255.0
     return image, label
 
 print("Build tf.data input pipeline")
 
-n_cores = multiprocessing.cpu_count()
-worker_thread = n_cores//hvd_size
-
 train = dataset["train"].shard(num_shards=hvd_size, index=hvd_rank)
-train = train.shuffle(32768)
+train = train.shuffle(16384)
 train = train.repeat(count=-1)
-train = train.map(format_train_example, num_parallel_calls=worker_thread-1)
+train = train.map(format_train_example, num_parallel_calls=worker_threads)
 train = train.batch(BATCH_SIZE, drop_remainder=True)
-train = train.prefetch(64)
+train = train.prefetch(100)
 
 valid = dataset["validation"].shard(num_shards=hvd_size, index=hvd_rank)
 valid = valid.repeat(count=-1)
-valid = valid.map(format_test_example, num_parallel_calls=worker_thread-1)
+valid = valid.map(format_test_example, num_parallel_calls=worker_threads)
 if args.imagenet2012:
     valid = valid.batch(BATCH_SIZE, drop_remainder=False)
 else:
     valid = valid.batch(32, drop_remainder=False)
-valid = valid.prefetch(64)
+valid = valid.prefetch(100)
 
 print("Running pipeline:")
 for batch in train.take(1):
     print("* Image shape:", tf.shape(batch[0]))
+    print(batch[0].numpy())
     print("* Label shape:", tf.shape(batch[1]))
+for batch in valid.take(1):
+    print("* Image shape:", tf.shape(batch[0]))
+    print(batch[0].numpy())
+    print("* Label shape:", tf.shape(batch[1]))
+    
+time.sleep(1)
 
 print("Build and distribute model")
 
@@ -147,6 +164,9 @@ elif args.dn201:
 elif args.mobilenet:
     print("Using MobileNetV2 model")
     model = cnn_models.mobilenet(IMG_SIZE, num_class, weights=None)
+elif args.toycnn:
+    print("Using Toy CNN model")
+    model = cnn_models.toycnn(IMG_SIZE, num_class, weights=None)
 else:
     print("Using ResNet-50 model")
     model = cnn_models.rn50(IMG_SIZE, num_class, weights=None)
@@ -159,7 +179,7 @@ if args.fp16comp:
 else:
     compression = hvd.Compression.none
 opt = hvd.DistributedOptimizer(opt, compression=compression)
-model.compile(loss="categorical_crossentropy",
+model.compile(loss="sparse_categorical_crossentropy",
               optimizer=opt,
               metrics=["acc"],
               experimental_run_tf_function=False)
@@ -195,6 +215,11 @@ else:
 
 train_start = time.time()
 
+if args.train_steps:
+    train_steps = args.train_steps
+if args.imagenet2012 and args.train_steps:
+    valid_steps = args.train_steps
+
 model.fit(train, steps_per_epoch=train_steps, validation_freq=2, 
           validation_data=valid, validation_steps=valid_steps,
           epochs=EPOCHS, callbacks=callbacks, verbose=verbose)
@@ -210,7 +235,9 @@ if hvd_rank == 0:
         nvlink_stats_recorder.plot_nvlink_traffic(smooth=SMOOTH, outpath="resnet_nvlink_util.png")
     duration = min(time_callback.times)
     fps = train_steps*BATCH_SIZE/duration
-    print("\nResults:\n")
+    print("\n")
+    print("Results:")
+    print("========\n")
     print("ResNet FPS:")
     print("*", hvd_size, "GPU:", int(fps*hvd_size))
     print("* Per GPU:", int(fps))
