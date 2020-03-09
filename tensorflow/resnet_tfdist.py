@@ -18,7 +18,7 @@ parser.add_argument("--imgsize", default=224, type=int,
                     help="Image size to use for training")
 parser.add_argument("--lr", default=0.01, type=float,
                     help="Learning rate")
-parser.add_argument("--epochs", default=40, type=int,
+parser.add_argument("--epochs", default=90, type=int,
                     help="Number of epochs to train for")
 parser.add_argument("--stats", action="store_true", default=False,
                     help="Record stats using NVStatsRecorder")
@@ -42,14 +42,10 @@ logger = logging.getLogger()
 logger.setLevel(logging.WARN)
 import time
 import tensorflow as tf
-
-gpus = tf.config.experimental.list_physical_devices("GPU")
-for gpu in gpus:
-    tf.config.experimental.set_memory_growth(gpu, False)
-
 import tensorflow_datasets as tfds
 import cnn_models
 import utils
+import optimizers
 
 if args.stats:
     from nvstatsrecorder.callbacks import NVStats, NVLinkStats
@@ -65,7 +61,9 @@ replicas = strategy.num_replicas_in_sync
 
 LEARNING_RATE = args.lr
 BATCH_SIZE = args.batchsize * replicas
-IMG_SIZE = (args.imgsize, args.imgsize)
+IMG_SIZE = args.imgsize
+IMG_SIZE_C = (args.imgsize, args.imgsize, 3)
+L_IMG_SIZE = int(args.imgsize*1.2)
 EPOCHS = args.epochs
 
 print("Number of devices:", replicas)
@@ -75,18 +73,23 @@ print("Adjusted learning rate:", LEARNING_RATE)
 
 print("Loading Dataset")
 
+options = tf.data.Options()
+read_config = tfds.ReadConfig(options=options, interleave_parallel_reads=n_cores)
+
 if args.imagenet2012:
     dataset, info = tfds.load("imagenet2012",
+                              read_config=read_config,
                               decoders={'image': tfds.decode.SkipDecoding(),},
                               with_info=True,
                               as_supervised=True)
-    num_class = 1000
 else:
     dataset, info = tfds.load("imagenette/320px",
+                              read_config=read_config,
                               decoders={'image': tfds.decode.SkipDecoding(),},
                               with_info=True,
                               as_supervised=True)
-    num_class = 10
+num_class = info.features["label"].num_classes
+print("Classes:", num_class)
     
 num_train = info.splits["train"].num_examples
 num_valid = info.splits["validation"].num_examples
@@ -100,13 +103,11 @@ if args.img_aug:
         image = tf.io.decode_jpeg(_image, channels=3,
                                   fancy_upscaling=False,
                                   dct_method="INTEGER_FAST")
-        image = tf.image.resize(image, IMG_SIZE)
-        image = tf.image.random_hue(image, 0.08)
-        image = tf.image.random_saturation(image, 0.6, 1.6)
-        image = tf.image.random_brightness(image, 0.05)
-        image = tf.image.random_contrast(image, 0.7, 1.3)
+        image = tf.image.resize_with_pad(image, L_IMG_SIZE, L_IMG_SIZE)
+        image = tf.image.random_crop(image, IMG_SIZE_C)
         image = tf.image.random_flip_left_right(image)
         image = tf.cast(image, tf.float32) / 255.0
+        label = tf.one_hot(label, num_class)
         return image, label
 else:
     @tf.function
@@ -114,8 +115,9 @@ else:
         image = tf.io.decode_jpeg(_image, channels=3,
                                   fancy_upscaling=False,
                                   dct_method="INTEGER_FAST")
-        image = tf.image.resize(image, IMG_SIZE)
+        image = tf.image.resize_with_pad(image, IMG_SIZE, IMG_SIZE)
         image = tf.cast(image, tf.float32) / 255.0
+        label = tf.one_hot(label, num_class)
         return image, label
 
 
@@ -124,18 +126,26 @@ def format_test_example(_image, label):
     image = tf.io.decode_jpeg(_image, channels=3,
                               fancy_upscaling=False,
                               dct_method="INTEGER_FAST")
-    image = tf.image.resize(image, IMG_SIZE)
+    image = tf.image.resize_with_pad(image, IMG_SIZE, IMG_SIZE)
     image = tf.cast(image, tf.float32) / 255.0
+    label = tf.one_hot(label, num_class)
     return image, label
 
 print("Build tf.data input pipeline")
 
 train = dataset["train"]
+train.options().experimental_threading.private_threadpool_size = n_cores
 train = train.shuffle(16384)
 train = train.repeat(count=-1)
 train = train.map(format_train_example, num_parallel_calls=n_cores)
 train = train.batch(BATCH_SIZE, drop_remainder=True)
-train = train.prefetch(128)
+train = train.prefetch(50)
+print("Running pipeline:")
+for batch in train.take(1):
+    print("* Image shape:", tf.shape(batch[0]))
+    _ = str(batch[0].numpy()).replace("\n", " ")
+    print("* Label shape:", tf.shape(batch[1]))
+time.sleep(1)
 
 valid = dataset["validation"]
 valid = valid.repeat(count=-1)
@@ -143,19 +153,14 @@ valid = valid.map(format_test_example, num_parallel_calls=n_cores)
 if args.imagenet2012:
     valid = valid.batch(BATCH_SIZE, drop_remainder=False)
 else:
-    valid = valid.batch(32, drop_remainder=False)
-valid = valid.prefetch(128)
-
+    valid = valid.batch(64, drop_remainder=False)
+valid = valid.prefetch(50)
 print("Running pipeline:")
-for batch in train.take(1):
-    print("* Image shape:", tf.shape(batch[0]))
-    test_batch = str(batch[0].numpy()).replace("\n", " ")
-    print(test_batch)
-    print("* Label shape:", tf.shape(batch[1]))
 for batch in valid.take(1):
     print("* Image shape:", tf.shape(batch[0]))
     _ = str(batch[0].numpy())
     print("* Label shape:", tf.shape(batch[1]))
+time.sleep(1)
     
 time.sleep(1)
 
@@ -168,38 +173,51 @@ if args.keras_amp:
 with strategy.scope():
     if args.rn152:
         print("Using ResNet-152 model")
-        model = cnn_models.rn152(IMG_SIZE, num_class, weights=None)
+        model = cnn_models.rn152((IMG_SIZE,IMG_SIZE), num_class, weights=None)
     elif args.dn201:
         print("Using DenseNet-201 model")
-        model = cnn_models.dn201(IMG_SIZE, num_class, weights=None)
+        model = cnn_models.dn201((IMG_SIZE,IMG_SIZE), num_class, weights=None)
     elif args.mobilenet:
         print("Using MobileNetV2 model")
-        model = cnn_models.mobilenet(IMG_SIZE, num_class, weights=None)
+        model = cnn_models.mobilenet((IMG_SIZE,IMG_SIZE), num_class, weights=None)
     else:
         print("Using ResNet-50 model")
-        model = cnn_models.rn50(IMG_SIZE, num_class, weights=None)
-    opt = tf.keras.optimizers.SGD(lr=LEARNING_RATE, momentum=0.85)
+        model = cnn_models.rn50((IMG_SIZE,IMG_SIZE), num_class, weights=None)
+    opt = tf.keras.optimizers.SGD(lr=LEARNING_RATE, momentum=0.8)
+    #opt = optimizers.NovoGrad(lr=LEARNING_RATE)
     if args.amp:
-        opt = tf.keras.mixed_precision.experimental.LossScaleOptimizer(opt, 128)
-    model.compile(loss="sparse_categorical_crossentropy",
+        opt = tf.keras.mixed_precision.experimental.LossScaleOptimizer(opt, "dynamic")
+    model.compile(loss="categorical_crossentropy",
                   optimizer=opt,
                   metrics=["acc"])
+    try:
+        model.load_weights("checkpoint.h5")
+    except Exception as e:
+        print(e)
+        print("Not resuming from checkpoint")
 
 print("Train model")
 
 verbose = 2
 time_callback = utils.TimeHistory()
-callbacks = [time_callback]
+checkpoints = tf.keras.callbacks.ModelCheckpoint("checkpoint.h5", monitor='val_loss', verbose=1, save_best_only=True, save_weights_only=True)
+reduce_lr = tf.keras.callbacks.ReduceLROnPlateau(monitor="val_loss", factor=0.1, patience=3)
+
+callbacks = [time_callback, checkpoints]
 
 if args.stats:
     SUDO_PASSWORD = os.environ["SUDO_PASSWORD"]
-    nv_stats = NVStats(gpu_index=0, interval=4)
-    nvlink_stats = NVLinkStats(SUDO_PASSWORD, gpus=[0,1,2,3], interval=4)
+    nv_stats = NVStats(gpu_index=0, interval=5)
+    nvlink_stats = NVLinkStats(SUDO_PASSWORD, gpus=[0,1,2,3], interval=5)
     callbacks.append(nv_stats)
     callbacks.append(nvlink_stats)
 
-train_steps = int(num_train/BATCH_SIZE)
-valid_steps = int(num_valid/BATCH_SIZE)
+if args.imagenet2012:
+    train_steps = int(num_train/BATCH_SIZE)
+    valid_steps = int(num_valid/BATCH_SIZE)
+else:
+    train_steps = int(num_train/BATCH_SIZE*2)
+    valid_steps = int(num_valid/64)
 
 if args.train_steps:
     train_steps = args.train_steps
@@ -225,11 +243,16 @@ train_end = time.time()
 if args.stats:
     nv_stats_recorder = nv_stats.recorder
     nvlink_stats_recorder = nvlink_stats.recorder
-    nv_stats_recorder.plot_gpu_util(smooth=10, outpath="resnet_gpu_util.png")
-    nvlink_stats_recorder.plot_nvlink_traffic(smooth=10, outpath="resnet_nvlink_util.png")
+    nv_stats_recorder.plot_gpu_util(smooth=5, outpath="resnet_gpu_util.png")
+    nvlink_stats_recorder.plot_nvlink_traffic(smooth=5, outpath="resnet_nvlink_util.png")
 
 duration = min(time_callback.times)
 fps = train_steps*BATCH_SIZE/duration
+
+model.load_weights("checkpoint.h5")
+
+with strategy.scope():
+    loss, acc = model.evaluate(valid, steps=valid_steps)
 
 print("\n")
 print("Results:")
@@ -238,3 +261,5 @@ print("ResNet FPS:")
 print("*", replicas, "GPU:", int(fps))
 print("* Per GPU:", int(fps/replicas))
 print("Total train time:", int(train_end-train_start))
+print("Loss:", loss)
+print("Acc:", acc)

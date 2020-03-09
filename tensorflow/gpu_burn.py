@@ -1,9 +1,11 @@
 import os
 import multiprocessing
-n_threads = multiprocessing.cpu_count()
+n_cores = multiprocessing.cpu_count()
+os.environ["TF_DISABLE_NVTX_RANGES"] = "1"
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
 os.environ["TF_GPU_THREAD_MODE"] = "gpu_private"
-os.environ["TF_GPU_THREAD_COUNT"] = str(n_threads)
+os.environ["TF_GPU_THREAD_COUNT"] = str(n_cores)
+os.environ["TF_FORCE_GPU_ALLOW_GROWTH"] = "false"
 
 import time
 from tqdm import tqdm
@@ -12,8 +14,7 @@ tf.config.experimental.set_synchronous_execution(False)
 gpu_list = tf.config.list_physical_devices("GPU")
 print("GPUs:", gpu_list)
 num_gpus = len(gpu_list)
-for gpu in gpu_list:
-    tf.config.experimental.set_memory_growth(gpu, False)
+tf.config.threading.set_inter_op_parallelism_threads(n_cores)
     
 from nvstatsrecorder.recorders import NVStatsRecorder, NVLinkStatsRecorder
 
@@ -57,28 +58,31 @@ fp16_tflops, fp32_tflops, fp64_tflops = [], [], []
 M_list = [16384, 8192, 4096, 2048, 1024, 512, 256, 128, 64, 32, 16, 4, 2, 1]
 
 nv_stats_recorder = NVStatsRecorder(gpu_index=0)
-nv_stats_recorder.start(interval=1)
+nv_stats_recorder.start(interval=2)
 
 print("\nStarting burn...\n")
 
-iterations = 40
+iterations = 50
 
 for M in tqdm(M_list):
+    print("FP64", M)
     ret = benchmark_matmul(M, gpus=num_gpus, dtype=tf.float64, iterations=iterations)
     tflops = ret * 2 * M**3 / 1e12
     fp64_matmul.append(ret)
     fp64_tflops.append(tflops)
-    time.sleep(1)
+    time.sleep(2)
+    print("FP32", M)
     ret = benchmark_matmul(M, gpus=num_gpus, dtype=tf.float32, iterations=iterations)
     tflops = ret * 2 * M**3 / 1e12
     fp32_matmul.append(ret)
     fp32_tflops.append(tflops)
-    time.sleep(1)
+    time.sleep(2)
+    print("FP16", M)
     ret = benchmark_matmul(M, gpus=num_gpus, dtype=tf.float16, iterations=iterations)
     tflops = ret * 2 * M**3 / 1e12
     fp16_matmul.append(ret)
     fp16_tflops.append(tflops)
-    time.sleep(1)
+    time.sleep(2)
     
 nv_stats_recorder.stop()
 

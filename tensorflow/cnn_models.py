@@ -6,7 +6,7 @@ import tensorflow.keras.applications as models
 
 def toycnn(img_size=(224,224), num_class=2, weights=None, dtype=tf.float32):
     model = tf.keras.models.Sequential([
-        layers.Conv2D(64, (3,3), padding="same", kernel_initializer="he_uniform", activation="relu"),
+        layers.Conv2D(64, (3,3), padding="same", kernel_initializer="he_uniform", activation="relu", input_shape=(img_size[0],img_size[1],3), dtype=dtype),
         layers.Conv2D(64, (3,3), padding="same", kernel_initializer="he_uniform", activation="relu"),
         layers.MaxPooling2D((4,4)),
         layers.BatchNormalization(fused=True),

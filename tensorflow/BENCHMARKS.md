@@ -12,9 +12,9 @@ python3 gpu_burn.py
 # 4 V100 (DGX Station)
 Maximum TFLOPS achieved on 4 GPUs
 =================================
-* FP64: 29 TFLOPS
+* FP64: 28 TFLOPS
 * FP32: 59 TFLOPS
-* FP16: 369 TFLOPS
+* FP16: 367 TFLOPS
 ```
 
 | GPU Utilization | TFLOPS Plot |
@@ -54,7 +54,8 @@ mpirun -np 4 \
     -bind-to none -map-by slot \
     -x NCCL_DEBUG=INFO -x LD_LIBRARY_PATH -x PATH \
     -mca pml ob1 -mca btl ^openib \
-    python3 resnet_horovod.py --amp --xla --dn201 --imgsize 256 --batchsize 56
+    python3 resnet_horovod.py --amp --xla \
+    --dn201 --imgsize 256 --batchsize 56
 ```
 
 | V100 | Training time | Images/sec | Val Acc |
